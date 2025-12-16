@@ -17,6 +17,8 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <atomic>
+#include <chrono>
 
 #define PORT_WORKER 5001
 #define PORT_WEB 8081
@@ -36,13 +38,53 @@ struct Model {
     double b;
 };
 
+// RAFT State
+enum RaftState { FOLLOWER, CANDIDATE, LEADER };
+
 // Global state
+std::atomic<RaftState> state(FOLLOWER);
+std::atomic<int> current_term(0);
+std::atomic<long long> last_heartbeat_time(0);
+
 int processed_chunks = 0;
 std::mutex stats_mutex;
 
 std::map<int, Model> model_store;
 std::mutex model_mutex;
 const std::string STATE_FILE = "worker_data.dat";
+
+// Helper: Get current time in milliseconds
+long long current_time_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
+// Election Timer Thread
+void election_timer() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        long long now = current_time_ms();
+
+        // Check for timeout (5 seconds)
+        if (now - last_heartbeat_time > 5000) {
+            if (state == FOLLOWER) {
+                state = CANDIDATE;
+                current_term++;
+                std::cout << "Leader Dead! Promoting to CANDIDATE..." << std::endl;
+                // Reset timer to avoid spamming the console immediately again,
+                // effectively acting as "starting a new election period"
+                last_heartbeat_time = current_time_ms();
+            } else if (state == CANDIDATE) {
+                // If we are already candidate and timeout again, typically we restart election (bump term)
+                // The prompt simplifies to "Change state to CANDIDATE", but since we are already there,
+                // we might just bump term to simulate a retry.
+                // However, to keep it simple and non-spammy:
+                last_heartbeat_time = current_time_ms();
+            }
+        }
+    }
+}
 
 // Helper to read exactly n bytes
 bool read_n_bytes(int socket, void* buffer, size_t n) {
@@ -161,6 +203,13 @@ void handle_client(int client_socket) {
         if (header == CMD_HEARTBEAT) {
             uint32_t dummy;
             if (read_n_bytes(client_socket, &dummy, 4)) {
+                // Heartbeat received logic
+                last_heartbeat_time = current_time_ms();
+
+                if (state == CANDIDATE || state == LEADER) {
+                    state = FOLLOWER;
+                    std::cout << "Leader detected. Demoting to FOLLOWER." << std::endl;
+                }
                 // std::cout << "[RAFT] Heartbeat received." << std::endl;
             }
         } 
@@ -406,7 +455,26 @@ void* web_server(void* arg) {
 
         std::string response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n";
         response += "<html><body><h1>Worker Node (C++)</h1>";
-        response += "<p>Status: <b>FOLLOWER</b></p>";
+
+        // Dynamic State Display
+        std::string state_str = "UNKNOWN";
+        std::string color = "black";
+        RaftState current_s = state.load();
+
+        if (current_s == FOLLOWER) {
+            state_str = "FOLLOWER";
+            color = "red";
+        } else if (current_s == CANDIDATE) {
+            state_str = "CANDIDATE";
+            color = "orange";
+        } else if (current_s == LEADER) {
+            state_str = "LEADER";
+            color = "green";
+        }
+
+        response += "<p>Status: <b style='color:" + color + ";'>" + state_str + "</b></p>";
+        response += "<p>Current Term: " + std::to_string(current_term) + "</p>";
+
         {
             std::lock_guard<std::mutex> lock(stats_mutex);
             response += "<p>Chunks Processed: " + std::to_string(processed_chunks) + "</p>";
@@ -424,7 +492,14 @@ void* web_server(void* arg) {
 }
 
 int main() {
+    // Initialize Timer
+    last_heartbeat_time = current_time_ms();
+
     load_state();
+
+    // Start Election Timer Thread
+    std::thread timer_thread(election_timer);
+    timer_thread.detach();
 
     // Start Web Server Thread
     pthread_t web_thread;
