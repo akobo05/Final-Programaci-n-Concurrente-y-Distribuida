@@ -12,8 +12,7 @@ try:
 except ImportError:
     HAS_PIL = False
 
-LEADER_HOST = 'localhost'
-LEADER_PORT = 5000
+NODES = [('localhost', 5000), ('localhost', 5001)]
 IMG_SIZE = 32 # 32x32 = 1024 pixels
 
 class DistributedClient:
@@ -29,6 +28,10 @@ class DistributedClient:
         # UI Elements
         self.label_title = tk.Label(root, text="Sistema de Entrenamiento Distribuido", font=("Arial", 16, "bold"))
         self.label_title.pack(pady=10)
+
+        # Failover Visual Indicator
+        self.lbl_conn_info = tk.Label(root, text="Desconectado", fg="gray", font=("Arial", 10))
+        self.lbl_conn_info.pack(pady=2)
 
         if not HAS_PIL:
             tk.Label(root, text="ADVERTENCIA: Librería 'Pillow' no encontrada. Instala con 'pip install Pillow'", fg="red").pack()
@@ -125,6 +128,32 @@ class DistributedClient:
         else:
             self.log("No se encontraron imágenes válidas.")
 
+    def get_active_leader_socket(self):
+        """
+        Intenta conectar a los nodos definidos en NODES uno por uno.
+        Retorna el socket conectado si tiene éxito.
+        """
+        for host, port in NODES:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(1.0) # 1 segundo timeout para descubrimiento rápido
+                s.connect((host, port))
+                s.settimeout(None) # Quitar timeout para operaciones normales
+
+                # Actualizar UI (thread safe)
+                self.root.after(0, lambda h=host, p=port: self.lbl_conn_info.config(
+                    text=f"Conectado a Líder en: {h}:{p}", fg="green"
+                ))
+                return s
+            except OSError:
+                s.close()
+
+        # Si fallan todos
+        self.root.after(0, lambda: self.lbl_conn_info.config(
+            text="Error: No se pudo conectar a ningún nodo.", fg="red"
+        ))
+        raise Exception("No se pudo conectar a ningún nodo líder activo.")
+
     def start_training_thread(self):
         threading.Thread(target=self.start_training).start()
 
@@ -133,11 +162,11 @@ class DistributedClient:
             return
 
         self.btn_train.config(state=tk.DISABLED)
-        self.log("Conectando al Líder...")
+        self.log("Buscando líder y conectando...")
 
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((LEADER_HOST, LEADER_PORT))
+            s = self.get_active_leader_socket()
+            with s:
                 self.log("Conectado. Enviando datos...")
 
                 # Protocol: [0x02] [Length] [NumSamples] [InputSize] [Inputs...] [Targets...]
@@ -189,9 +218,8 @@ class DistributedClient:
 
     def update_model_name(self, model_id, name):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((LEADER_HOST, LEADER_PORT))
-                
+            s = self.get_active_leader_socket()
+            with s:
                 # Protocol: [0x09] [Length] [ModelID] [Name]
                 header = b'\x09'
                 name_bytes = name.encode('utf-8')
@@ -213,9 +241,8 @@ class DistributedClient:
 
     def fetch_models(self):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((LEADER_HOST, LEADER_PORT))
-                
+            s = self.get_active_leader_socket()
+            with s:
                 # Protocol: [0x08] (No payload)
                 s.sendall(b'\x08')
                 
@@ -275,9 +302,8 @@ class DistributedClient:
 
     def send_prediction(self, model_id, val_vec):
         try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((LEADER_HOST, LEADER_PORT))
-                
+            s = self.get_active_leader_socket()
+            with s:
                 # Protocol: [0x06] [Length] [ModelID] [InputVec...]
                 header = b'\x06'
                 payload = struct.pack('>I', model_id)
