@@ -386,6 +386,40 @@ public class NodoLider {
                     } else {
                         out.writeUTF("Model not found.");
                     }
+                } else if (header == 0x10) { // GET_NODES
+                    int count = workers.size();
+                    out.writeInt(count);
+                    for (WorkerConnection worker : workers) {
+                        // Return actual IP if possible, else localhost
+                        String host = worker.socket.getInetAddress().getHostAddress();
+                        if (host.equals("0:0:0:0:0:0:0:1")) host = "localhost"; // Handle IPv6 loopback
+                        out.writeUTF(host);
+                        out.writeInt(worker.port);
+                    }
+                } else if (header == 0x11) { // KILL_WORKER
+                    int portToKill = in.readInt();
+                    boolean found = false;
+                    WorkerConnection target = null;
+
+                    for (WorkerConnection worker : workers) {
+                        if (worker.port == portToKill) {
+                            target = worker;
+                            break;
+                        }
+                    }
+
+                    if (target != null) {
+                        try {
+                            target.socket.close();
+                        } catch (IOException e) {
+                            // Ignore
+                        }
+                        workers.remove(target);
+                        out.writeUTF("Worker on port " + portToKill + " disconnected.");
+                        System.out.println("Worker on port " + portToKill + " killed by client request.");
+                    } else {
+                        out.writeUTF("Worker not found.");
+                    }
                 }
 
             } catch (IOException e) {

@@ -403,12 +403,14 @@ void handle_client(int client_socket) {
                     if (m.input_size != (uint32_t)input_size) {
                         response = "Error: Input size mismatch.";
                     } else {
-                        double prediction = m.b;
+                        double z = m.b;
                         for(int i=0; i<input_size; i++) {
-                            prediction += m.w[i] * input_val[i];
+                            z += m.w[i] * input_val[i];
                         }
+                        double prob = sigmoid(z);
                         std::ostringstream oss;
-                        oss << "Prediction: " << prediction;
+                        oss << "Prediction: " << (prob > 0.5 ? "Dígito 1" : "Dígito 0")
+                            << " (Prob: " << std::fixed << std::setprecision(2) << prob << ")";
                         response = oss.str();
                     }
                 } else {
