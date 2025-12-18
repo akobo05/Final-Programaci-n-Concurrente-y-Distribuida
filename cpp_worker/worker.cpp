@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <atomic>
 #include <chrono>
+#include <endian.h>
 
 #define BUFFER_SIZE 4096
 
@@ -53,7 +54,7 @@ std::mutex stats_mutex;
 
 std::map<int, Model> model_store;
 std::mutex model_mutex;
-const std::string STATE_FILE = "worker_data.dat";
+std::string state_filename = "worker_data.dat"; // Will be updated in main
 
 // Helper: Get current time in milliseconds
 long long current_time_ms() {
@@ -122,9 +123,9 @@ double sigmoid(double z) {
 // Save state to disk
 void save_state() {
     std::lock_guard<std::mutex> lock(model_mutex);
-    std::ofstream outfile(STATE_FILE, std::ios::binary);
+    std::ofstream outfile(state_filename, std::ios::binary);
     if (!outfile.is_open()) {
-        std::cerr << "[Error] Could not save state." << std::endl;
+        std::cerr << "[Error] Could not save state to " << state_filename << std::endl;
         return;
     }
 
@@ -152,7 +153,7 @@ void save_state() {
 
 // Load state from disk
 void load_state() {
-    std::ifstream infile(STATE_FILE, std::ios::binary);
+    std::ifstream infile(state_filename, std::ios::binary);
     if (!infile.is_open()) return;
 
     uint32_t net_count;
@@ -181,7 +182,7 @@ void load_state() {
 
         model_store[id] = { (uint32_t)size, w, b };
     }
-    std::cout << "[State] Loaded " << count << " models from disk." << std::endl;
+    std::cout << "[State] Loaded " << count << " models from disk (" << state_filename << ")." << std::endl;
 }
 
 void send_utf_string(int socket, std::string msg) {
@@ -226,7 +227,7 @@ void handle_client(int client_socket) {
             std::vector<char> payload(length);
             if (!read_n_bytes(client_socket, payload.data(), length)) break;
 
-            // Parse Protocol: [NumSamples (4)] [InputSize (4)] [Inputs...] [Targets...]
+            // Parse Protocol: [NumSamples (4)] [InputSize (4)] [Weights (Size*8)] [Bias (8)] [Inputs...] [Targets...]
             if (length < 8) {
                 std::cerr << "Invalid DISTRIBUTE_CHUNK payload length." << std::endl;
                 continue;
@@ -235,12 +236,32 @@ void handle_client(int client_socket) {
             uint32_t num_samples = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
             uint32_t input_size = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
 
-            size_t expected_size = 8 + (size_t)num_samples * input_size * 8 + (size_t)num_samples * 8;
+            // Check if payload contains weights and bias
+            size_t weights_size = (size_t)input_size * 8;
+            size_t bias_size = 8;
+            size_t data_size = (size_t)num_samples * input_size * 8 + (size_t)num_samples * 8;
+
+            size_t expected_size = 8 + weights_size + bias_size + data_size;
+
             if (length < expected_size) {
-                 std::cerr << "Invalid DISTRIBUTE_CHUNK payload size." << std::endl;
+                 std::cerr << "Invalid DISTRIBUTE_CHUNK payload size. Expected " << expected_size << " got " << length << std::endl;
                  continue;
             }
 
+            // Read Weights
+            std::vector<double> w(input_size);
+            for(int j=0; j<input_size; j++) {
+                uint64_t temp;
+                std::memcpy(&temp, payload.data() + offset, 8); offset += 8;
+                w[j] = ntohd(temp);
+            }
+
+            // Read Bias
+            uint64_t temp_b;
+            std::memcpy(&temp_b, payload.data() + offset, 8); offset += 8;
+            double b = ntohd(temp_b);
+
+            // Read Inputs and Targets
             std::vector<std::vector<double>> inputs(num_samples, std::vector<double>(input_size));
             std::vector<double> targets(num_samples);
 
@@ -259,10 +280,8 @@ void handle_client(int client_socket) {
 
             std::cout << "[WORKER] Training on " << num_samples << " images (size " << input_size << ")..." << std::endl;
 
-            // Linear Regression Gradient Descent (Vectorized)
-            // Model: y = W.x + b
-            std::vector<double> w(input_size, 0.5); // Fixed start
-            double b = 0.5;
+            // Logistic Regression Gradient Descent
+            // Model: y = sigmoid(W.x + b)
             
             std::vector<double> grad_w(input_size, 0.0);
             double grad_b = 0.0;
@@ -275,6 +294,23 @@ void handle_client(int client_socket) {
                 
                 double pred = sigmoid(z);
                 double error = targets[i] - pred;
+                // Note: For Cross-Entropy Loss, dL/dz = pred - target = -error
+                // Gradient for weights = (pred - target) * x = -error * x
+                // Gradient for bias = (pred - target) = -error
+
+                // The prompt says: "aplica la función sigmoid a la suma ponderada antes de calcular el error."
+                // error = targets[i] - pred;
+                // If the previous code used -2 * inputs * error, it was mimicking MSE derivative for linear regression.
+                // For Logistic Regression with Cross Entropy, the gradient is simply inputs * (pred - target).
+                // Or inputs * -error.
+                // I will stick to the previous pattern style but ensure it makes sense.
+                // grad_w += -2 * input * error  --> This is 2 * input * (target - pred) = 2 * input * -(pred - target).
+                // It is proportional to the correct gradient (factor of 2 doesn't matter much for SGD if learning rate is adjusted).
+                // I'll keep the -2 factor to be consistent with "Updating existing logic" unless it's clearly wrong.
+                // Actually, standard is usually just (pred - y) * x.
+                // Previous code: `grad_w[j] += -2 * inputs[i][j] * error;` where error = target - pred.
+                // So `grad_w += -2 * x * (y - p) = 2 * x * (p - y)`.
+                // This is 2 * Gradient. It works.
                 
                 for(int j=0; j<input_size; j++) {
                     grad_w[j] += -2 * inputs[i][j] * error;
@@ -409,7 +445,7 @@ void handle_client(int client_socket) {
                         }
                         double prob = sigmoid(z);
                         std::ostringstream oss;
-                        oss << "Prediction: " << (prob > 0.5 ? "Dígito 1" : "Dígito 0")
+                        oss << (prob > 0.5 ? "Dígito 1" : "Dígito 0")
                             << " (Prob: " << std::fixed << std::setprecision(2) << prob << ")";
                         response = oss.str();
                     }
@@ -505,6 +541,9 @@ int main(int argc, char* argv[]) {
         port_worker = std::stoi(argv[1]);
         port_web = std::stoi(argv[2]);
     }
+
+    // Dynamic State Filename
+    state_filename = "worker_" + std::to_string(port_worker) + ".dat";
 
     // Initialize Timer
     last_heartbeat_time = current_time_ms();

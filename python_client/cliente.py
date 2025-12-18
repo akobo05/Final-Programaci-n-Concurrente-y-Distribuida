@@ -5,6 +5,7 @@ import struct
 import random
 import threading
 import os
+import time
 
 try:
     from PIL import Image, ImageTk
@@ -19,11 +20,12 @@ class DistributedClient:
     def __init__(self, root):
         self.root = root
         self.root.title("Sistema de Entrenamiento Distribuido")
-        self.root.geometry("600x550")
+        self.root.geometry("600x650")
 
         self.inputs = []
         self.targets = []
         self.model_list = [] # List of tuples (id, name)
+        self.running = True
 
         # UI Elements
         self.label_title = tk.Label(root, text="Sistema de Entrenamiento Distribuido", font=("Arial", 16, "bold"))
@@ -49,8 +51,8 @@ class DistributedClient:
         self.btn_train = tk.Button(self.frame_train, text="Iniciar Entrenamiento", command=self.start_training_thread, state=tk.DISABLED)
         self.btn_train.pack(pady=5)
 
-        # Cluster Management Section
-        self.frame_cluster = tk.LabelFrame(root, text="Gestión del Cluster", padx=10, pady=10)
+        # Cluster Management Section (Gestión de Resiliencia)
+        self.frame_cluster = tk.LabelFrame(root, text="Gestión de Resiliencia", padx=10, pady=10)
         self.frame_cluster.pack(pady=5, fill="x", padx=10)
 
         # Treeview
@@ -58,8 +60,8 @@ class DistributedClient:
         self.tree = ttk.Treeview(self.frame_cluster, columns=columns, show='headings', height=3)
         self.tree.heading("ip", text="IP")
         self.tree.heading("port", text="Puerto")
-        self.tree.column("ip", width=100)
-        self.tree.column("port", width=80)
+        self.tree.column("ip", width=150)
+        self.tree.column("port", width=100)
         self.tree.pack(side=tk.LEFT, padx=5)
 
         self.btn_kill = tk.Button(self.frame_cluster, text="Simular Caída", command=self.kill_worker)
@@ -85,16 +87,26 @@ class DistributedClient:
         
         # Initial fetch
         self.fetch_models_thread()
-        # Start cluster monitor loop
-        self.monitor_cluster_loop()
+
+        # Start cluster monitor thread
+        self.monitor_thread = threading.Thread(target=self.monitor_cluster_loop, daemon=True)
+        self.monitor_thread.start()
+
+        # Handle close
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def on_close(self):
+        self.running = False
+        self.root.destroy()
 
     def monitor_cluster_loop(self):
-        threading.Thread(target=self.fetch_workers).start()
-        self.root.after(3000, self.monitor_cluster_loop)
+        while self.running:
+            self.fetch_workers()
+            time.sleep(3)
 
     def fetch_workers(self):
         try:
-            s = self.get_active_leader_socket()
+            s = self.get_active_leader_socket(silent=True)
             with s:
                 # Protocol: [0x10] (No payload)
                 s.sendall(b'\x10')
@@ -117,17 +129,29 @@ class DistributedClient:
 
                     workers.append((host, port))
 
-                self.root.after(0, lambda: self.update_cluster_ui(workers))
+                if self.running:
+                    self.root.after(0, lambda: self.update_cluster_ui(workers))
         except:
             pass # Silent fail if leader down
 
     def update_cluster_ui(self, workers):
-        # Clear existing
-        for item in self.tree.get_children():
-            self.tree.delete(item)
+        try:
+            # Store current selection
+            selected_item = self.tree.selection()
+            selected_port = None
+            if selected_item:
+                selected_port = self.tree.item(selected_item[0])['values'][1]
 
-        for w in workers:
-            self.tree.insert('', tk.END, values=w)
+            # Clear existing
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            for w in workers:
+                item_id = self.tree.insert('', tk.END, values=w)
+                if selected_port and w[1] == selected_port:
+                    self.tree.selection_set(item_id)
+        except Exception:
+            pass
 
     def kill_worker(self):
         selection = self.tree.selection()
@@ -137,8 +161,6 @@ class DistributedClient:
 
         item = self.tree.item(selection[0])
         values = item['values']
-        # values is a list/tuple: ['ip', port]
-        # Tkinter treeview values are often strings even if inserted as int
         port = int(values[1])
 
         if messagebox.askyesno("Confirmar", f"¿Seguro que deseas desconectar el worker en puerto {port}?"):
@@ -158,7 +180,7 @@ class DistributedClient:
                 msg = resp_bytes.decode('utf-8')
 
                 self.root.after(0, lambda: self.log(f"Respuesta Cluster: {msg}"))
-                self.fetch_workers() # Refresh list immediately
+                # self.fetch_workers() # Loop will pick it up
         except Exception as e:
             self.root.after(0, lambda: self.log(f"Error gestionando cluster: {e}"))
 
@@ -220,7 +242,7 @@ class DistributedClient:
         else:
             self.log("No se encontraron imágenes válidas.")
 
-    def get_active_leader_socket(self):
+    def get_active_leader_socket(self, silent=False):
         """
         Intenta conectar a los nodos definidos en NODES uno por uno.
         Retorna el socket conectado si tiene éxito.
@@ -244,7 +266,10 @@ class DistributedClient:
         self.root.after(0, lambda: self.lbl_conn_info.config(
             text="Error: No se pudo conectar a ningún nodo.", fg="red"
         ))
-        raise Exception("No se pudo conectar a ningún nodo líder activo.")
+        if not silent:
+            raise Exception("No se pudo conectar a ningún nodo líder activo.")
+        else:
+            raise Exception("Silent fail")
 
     def start_training_thread(self):
         threading.Thread(target=self.start_training).start()
@@ -259,7 +284,8 @@ class DistributedClient:
         try:
             s = self.get_active_leader_socket()
             with s:
-                self.log("Conectado. Enviando datos...")
+                self.log("Conectado. Iniciando entrenamiento (50 épocas)...")
+                self.log("Esto puede tardar unos momentos.")
 
                 # Protocol: [0x02] [Length] [NumSamples] [InputSize] [Inputs...] [Targets...]
                 header = b'\x02'
@@ -278,8 +304,9 @@ class DistributedClient:
                 s.sendall(struct.pack('>I', length))
                 s.sendall(payload)
 
-                self.log("Datos enviados. Esperando respuesta...")
+                self.log("Datos enviados. Procesando en el cluster...")
                 
+                # Because the server blocks for 50 epochs, we increase timeout or keep it None (blocking)
                 response_data = s.recv(1024)
                 if len(response_data) > 2:
                     msg_len = struct.unpack('>H', response_data[:2])[0]
@@ -333,7 +360,7 @@ class DistributedClient:
 
     def fetch_models(self):
         try:
-            s = self.get_active_leader_socket()
+            s = self.get_active_leader_socket(silent=True)
             with s:
                 # Protocol: [0x08] (No payload)
                 s.sendall(b'\x08')
