@@ -17,3 +17,10 @@ java_leader/NodoLider$WebMonitor.class
 java_leader/NodoLider$WorkerConnection.class
 cpp_worker/worker
 estado_sistema.dat
+java_leader/NodoLider$Chunk.class
+java_leader/NodoLider$WorkerServer.class
+worker_5001.dat
+worker_5002.dat
+worker_5003.dat
+
+java_leader/NodoLider$Chunk.class
