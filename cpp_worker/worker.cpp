@@ -20,9 +20,11 @@
 #include <atomic>
 #include <chrono>
 
-#define PORT_WORKER 5001
-#define PORT_WEB 8081
 #define BUFFER_SIZE 4096
+
+// Defaults
+int port_worker = 5001;
+int port_web = 8081;
 
 // Protocol Commands
 const uint8_t CMD_HEARTBEAT = 0x01;
@@ -433,7 +435,7 @@ void* web_server(void* arg) {
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT_WEB);
+    address.sin_port = htons(port_web);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("web bind failed");
@@ -445,7 +447,7 @@ void* web_server(void* arg) {
         return NULL;
     }
 
-    std::cout << "Web Monitor listening on port " << PORT_WEB << std::endl;
+    std::cout << "Web Monitor listening on port " << port_web << std::endl;
 
     while (true) {
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
@@ -491,7 +493,12 @@ void* web_server(void* arg) {
     return NULL;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc >= 3) {
+        port_worker = std::stoi(argv[1]);
+        port_web = std::stoi(argv[2]);
+    }
+
     // Initialize Timer
     last_heartbeat_time = current_time_ms();
 
@@ -526,7 +533,7 @@ int main() {
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT_WORKER);
+    address.sin_port = htons(port_worker);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
@@ -538,7 +545,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    std::cout << "Worker listening on port " << PORT_WORKER << std::endl;
+    std::cout << "Worker initiated on port: " << port_worker << " (Web: " << port_web << ")" << std::endl;
 
     while (true) {
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
