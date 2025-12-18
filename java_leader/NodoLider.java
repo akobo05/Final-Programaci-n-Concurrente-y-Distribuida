@@ -5,13 +5,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.Random;
 
 public class NodoLider {
     private static final int PORT_CLIENT_SERVER = 5000;
+    private static final int PORT_WORKER_SERVER = 9000;
     private static final int PORT_WEB = 8080;
-    private static final String WORKER_HOST = "localhost";
 
     // Protocol Commands
     private static final byte CMD_HEARTBEAT = 0x01;
@@ -23,46 +24,40 @@ public class NodoLider {
         Socket socket;
         DataOutputStream out;
         DataInputStream in;
-        int port;
-        String host;
+        int remotePort; // Port reported by Worker for ID
+        String remoteIp;
 
-        public WorkerConnection(String host, int port) throws IOException {
-            this.port = port;
-            this.host = host;
-            this.socket = new Socket(host, port);
+        public WorkerConnection(Socket socket) throws IOException {
+            this.socket = socket;
             this.out = new DataOutputStream(socket.getOutputStream());
             this.in = new DataInputStream(socket.getInputStream());
+            this.remoteIp = socket.getInetAddress().getHostAddress();
+
+            // Handshake to get Identity
+            // Worker sends 4-byte Port ID
+            // Set timeout for handshake
+            socket.setSoTimeout(5000);
+            try {
+                this.remotePort = in.readInt();
+            } catch (Exception e) {
+                this.remotePort = -1;
+            }
+            socket.setSoTimeout(0); // Reset
         }
     }
 
     // Shared State
-    private static List<WorkerConnection> workers = new CopyOnWriteArrayList<>();
-    private static final Object workersLock = new Object();
+    private static CopyOnWriteArrayList<WorkerConnection> workers = new CopyOnWriteArrayList<>();
     private static AtomicInteger trainedModels = new AtomicInteger(0);
 
     public static void main(String[] args) {
         System.out.println("Starting Leader Node...");
 
-        // Parse arguments for worker ports
-        List<Integer> workerPorts = new ArrayList<>();
-        if (args.length > 0) {
-            for (String arg : args) {
-                try {
-                    workerPorts.add(Integer.parseInt(arg));
-                } catch (NumberFormatException e) {
-                    System.err.println("Invalid port: " + arg);
-                }
-            }
-        } else {
-            // Default fallback if no args provided
-            workerPorts.add(5001);
-        }
-
         // 0. Load State
         loadState();
 
-        // 1. Connect to Workers
-        connectToWorkers(workerPorts);
+        // 1. Start Worker Server (Accepts Workers)
+        new Thread(new WorkerServer()).start();
 
         // 2. Start RAFT Heartbeat Thread
         new Thread(new RaftController()).start();
@@ -74,23 +69,24 @@ public class NodoLider {
         startClientServer();
     }
 
-    private static void connectToWorkers(List<Integer> ports) {
-        for (int port : ports) {
-            boolean connected = false;
-            // Retry loop for each worker
-            while (!connected) {
-                try {
-                    WorkerConnection worker = new WorkerConnection(WORKER_HOST, port);
-                    workers.add(worker);
-                    System.out.println("Connected to Worker at " + WORKER_HOST + ":" + port);
-                    connected = true;
-                } catch (IOException e) {
-                    System.out.println("Waiting for Worker on port " + port + "... (" + e.getMessage() + ")");
+    // Worker Server Logic
+    static class WorkerServer implements Runnable {
+        @Override
+        public void run() {
+            try (ServerSocket server = new ServerSocket(PORT_WORKER_SERVER)) {
+                System.out.println("Worker Server listening on port " + PORT_WORKER_SERVER);
+                while (true) {
                     try {
-                        Thread.sleep(2000);
-                    } catch (InterruptedException ex) {
+                        Socket socket = server.accept();
+                        WorkerConnection wc = new WorkerConnection(socket);
+                        workers.add(wc);
+                        System.out.println("Worker Connected: " + wc.remoteIp + " (ID: " + wc.remotePort + ")");
+                    } catch (IOException e) {
+                        System.err.println("Error accepting worker: " + e.getMessage());
                     }
                 }
+            } catch (IOException e) {
+                e.printStackTrace();
             }
         }
     }
@@ -101,21 +97,22 @@ public class NodoLider {
         public void run() {
             while (true) {
                 try {
-                    synchronized (workersLock) {
-                        for (WorkerConnection worker : workers) {
-                            try {
+                    for (WorkerConnection worker : workers) {
+                        try {
+                            synchronized (worker.out) {
                                 worker.out.writeByte(CMD_HEARTBEAT);
                                 worker.out.writeInt(0); // Length 0
                                 worker.out.flush();
-                            } catch (IOException e) {
-                                System.err.println("Error sending heartbeat to worker " + worker.port + ": " + e.getMessage());
-                                // Potential reconnection logic or removal
                             }
+                        } catch (IOException e) {
+                            System.err.println("Worker " + worker.remotePort + " failed heartbeat. Removing.");
+                            workers.remove(worker);
+                            try { worker.socket.close(); } catch (Exception ex) {}
                         }
                     }
                     Thread.sleep(5000);
                 } catch (Exception e) {
-                    System.err.println("Error in RaftController: " + e.getMessage());
+                    // Ignore
                 }
             }
         }
@@ -172,8 +169,19 @@ public class NodoLider {
     }
 
     private static java.util.Map<Integer, Model> modelStore = new java.util.concurrent.ConcurrentHashMap<>();
-
     private static java.util.Map<Integer, String> modelNames = new java.util.concurrent.ConcurrentHashMap<>();
+
+    static class Chunk {
+        double[][] inputs;
+        double[] targets;
+        int startIdx;
+
+        public Chunk(double[][] inputs, double[] targets, int startIdx) {
+            this.inputs = inputs;
+            this.targets = targets;
+            this.startIdx = startIdx;
+        }
+    }
 
     static class ClientHandler implements Runnable {
         private Socket client;
@@ -191,8 +199,6 @@ public class NodoLider {
 
                 if (header == 0x02) { // START_TRAIN
                     int length = in.readInt();
-
-                    // Parse: [NumSamples (4)] [InputSize (4)] [Inputs...] [Targets...]
                     byte[] payload = new byte[length];
                     in.readFully(payload);
                     ByteBuffer bb = ByteBuffer.wrap(payload);
@@ -211,180 +217,208 @@ public class NodoLider {
                     for (int i = 0; i < numSamples; i++)
                         targets[i] = bb.getDouble();
 
-                    System.out
-                            .println("[CLIENT] Training Request: " + numSamples + " images (size " + inputSize + ").");
+                    System.out.println("[CLIENT] Training Request: " + numSamples + " images.");
 
-                    // Initial Random Weights
+                    // Initial Random Weights (-0.01 to 0.01)
                     double[] w = new double[inputSize];
                     Random rand = new Random();
                     for(int j=0; j<inputSize; j++) {
-                        w[j] = (rand.nextDouble() * 0.02) - 0.01; // -0.01 to 0.01
+                        w[j] = (rand.nextDouble() * 0.02) - 0.01;
                     }
                     double b = (rand.nextDouble() * 0.02) - 0.01;
 
-                    // Training Loop (50 Epochs)
                     System.out.println("Starting 50 epochs of distributed training...");
 
                     for (int epoch = 0; epoch < 50; epoch++) {
-                        // Split Data among Leader + Workers
-                        int totalNodes = 1 + workers.size();
-                        int chunkSize = numSamples / totalNodes;
+                        // 1. Create Task Queue
+                        ConcurrentLinkedQueue<Chunk> taskQueue = new ConcurrentLinkedQueue<>();
 
-                        // --- 1. Leader Processing (Local) ---
-                        int startIdx = 0;
-                        int endIdx = chunkSize + (numSamples % totalNodes); // Give remainder to leader
+                        // Decide chunk size based on CURRENT workers (soft target) or fixed size
+                        // Better to use fixed reasonable size or divide by current workers.
+                        int currentWorkerCount = workers.size();
+                        int splits = Math.max(1, currentWorkerCount); // at least 1 split
+                        int chunkSize = numSamples / splits;
+                        if (chunkSize < 1) chunkSize = 1;
 
-                        double[][] localInputs = Arrays.copyOfRange(inputs, startIdx, endIdx);
-                        double[] localTargets = Arrays.copyOfRange(targets, startIdx, endIdx);
+                        int start = 0;
+                        while (start < numSamples) {
+                            int end = Math.min(start + chunkSize, numSamples);
+                            double[][] chunkInputs = Arrays.copyOfRange(inputs, start, end);
+                            double[] chunkTargets = Arrays.copyOfRange(targets, start, end);
+                            taskQueue.add(new Chunk(chunkInputs, chunkTargets, start));
+                            start = end;
+                        }
 
-                        // Pass current weights to local compute
-                        double[] localGrads = TrainingCore.computeGradients(localInputs, localTargets, inputSize, w, b);
+                        List<double[]> gradients = new ArrayList<>();
 
-                        startIdx = endIdx;
+                        // Process Queue
+                        while (!taskQueue.isEmpty()) {
+                            // Find available worker
+                            WorkerConnection assignedWorker = null;
+                            for (WorkerConnection wc : workers) {
+                                assignedWorker = wc;
+                                break;
+                            }
 
-                        // --- 2. Worker Processing (Distributed) ---
-                        List<double[]> allWorkerGrads = new ArrayList<>();
+                            if (workers.isEmpty()) {
+                                System.out.println("No workers available! Waiting...");
+                                try { Thread.sleep(1000); } catch (Exception e) {}
+                                continue;
+                            }
 
-                        if (!workers.isEmpty()) {
-                            synchronized (workersLock) {
-                                for (WorkerConnection worker : workers) {
-                                    int wStart = startIdx;
-                                    int wEnd = startIdx + chunkSize;
-                                    startIdx = wEnd;
+                            // Let's implement the "Master-Worker" pattern correctly.
+                            // We have N workers. We have M chunks.
+                            // Create N threads (one per worker).
+                            // Each thread pulls from `taskQueue`.
 
-                                    int wCount = wEnd - wStart;
-                                    if (wCount <= 0) continue;
+                            List<Thread> threads = new ArrayList<>();
+                            List<WorkerConnection> snapshotWorkers = new ArrayList<>(workers);
 
-                                    try {
-                                        worker.out.writeByte(CMD_DISTRIBUTE_CHUNK);
-                                        // Payload: [NumSamples][InputSize][Weights][Bias][Inputs][Targets]
-                                        int payloadSize = 4 + 4 + (inputSize * 8) + 8 + (wCount * inputSize * 8) + (wCount * 8);
-                                        worker.out.writeInt(payloadSize);
-                                        worker.out.writeInt(wCount);
-                                        worker.out.writeInt(inputSize);
+                            // Collections.synchronizedList for gradients
+                            List<double[]> threadSafeGradients = java.util.Collections.synchronizedList(gradients);
 
-                                        // Send Weights & Bias
-                                        for(double val : w) worker.out.writeDouble(val);
-                                        worker.out.writeDouble(b);
+                            final double bCopy = b;
 
-                                        // Send Data
-                                        for (int i = wStart; i < wEnd; i++) {
-                                            for (int j = 0; j < inputSize; j++)
-                                                worker.out.writeDouble(inputs[i][j]);
+                            for (WorkerConnection wc : snapshotWorkers) {
+                                Thread t = new Thread(() -> {
+                                    while (true) {
+                                        Chunk c = taskQueue.poll();
+                                        if (c == null) break; // No more work
+
+                                        try {
+                                            synchronized (wc.out) { // Lock socket
+                                                wc.out.writeByte(CMD_DISTRIBUTE_CHUNK);
+                                                // Payload
+                                                int payloadSize = 4 + 4 + (inputSize * 8) + 8 + (c.inputs.length * inputSize * 8) + (c.inputs.length * 8);
+                                                wc.out.writeInt(payloadSize);
+                                                wc.out.writeInt(c.inputs.length);
+                                                wc.out.writeInt(inputSize);
+                                                // Weights
+                                                for(double val : w) wc.out.writeDouble(val);
+                                                wc.out.writeDouble(bCopy);
+                                                // Data
+                                                for (int i = 0; i < c.inputs.length; i++) {
+                                                    for (int j = 0; j < inputSize; j++) wc.out.writeDouble(c.inputs[i][j]);
+                                                }
+                                                for (int i = 0; i < c.targets.length; i++) wc.out.writeDouble(c.targets[i]);
+                                                wc.out.flush();
+
+                                                // Read Result
+                                                byte respHeader = wc.in.readByte();
+                                                if (respHeader == CMD_TRAIN_RESULT) {
+                                                    int respLen = wc.in.readInt();
+                                                    double[] wGrads = new double[inputSize + 1];
+                                                    for (int j = 0; j < inputSize; j++) wGrads[j] = wc.in.readDouble();
+                                                    wGrads[inputSize] = wc.in.readDouble(); // Bias
+                                                    threadSafeGradients.add(wGrads);
+                                                } else {
+                                                    throw new IOException("Unexpected header: " + respHeader);
+                                                }
+                                            }
+                                        } catch (IOException e) {
+                                            System.out.println("Worker " + wc.remotePort + " failed. Reassigning task...");
+                                            taskQueue.add(c); // Reassign
+                                            workers.remove(wc);
+                                            try { wc.socket.close(); } catch(Exception ex) {}
+                                            break; // Worker dead, thread exit
                                         }
-                                        for (int i = wStart; i < wEnd; i++)
-                                            worker.out.writeDouble(targets[i]);
-                                        worker.out.flush();
-                                    } catch (IOException e) {
-                                        System.err.println("Error sending chunk to worker " + worker.port);
                                     }
-                                }
+                                });
+                                t.start();
+                                threads.add(t);
+                            }
 
-                                // Receive results
-                                for (WorkerConnection worker : workers) {
-                                    try {
-                                        byte respHeader = worker.in.readByte();
-                                        if (respHeader == CMD_TRAIN_RESULT) {
-                                            int respLen = worker.in.readInt();
-                                            double[] wGrads = new double[inputSize + 1];
-                                            for (int j = 0; j < inputSize; j++)
-                                                wGrads[j] = worker.in.readDouble();
-                                            wGrads[inputSize] = worker.in.readDouble(); // Bias
-                                            allWorkerGrads.add(wGrads);
-                                        }
-                                    } catch (IOException e) {
-                                        System.err.println("Error receiving from worker " + worker.port);
-                                    }
+                            for (Thread t : threads) {
+                                try { t.join(); } catch (InterruptedException e) {}
+                            }
+
+                            // If queue still has items (all workers died?), we loop again
+                            if (!taskQueue.isEmpty()) {
+                                if (workers.isEmpty()) {
+                                    System.out.println("All workers dead. Pausing...");
+                                    try { Thread.sleep(2000); } catch (Exception e) {}
                                 }
+                                continue; // Retry remaining chunks
+                            } else {
+                                break; // Epoch done
                             }
                         }
 
-                        // --- 3. Aggregate Gradients ---
+                        // Aggregate
+                        if (gradients.isEmpty()) continue;
+
                         double[] avg_dw = new double[inputSize];
                         double avg_db = 0.0;
-
-                        // Sum local
-                        for (int j = 0; j < inputSize; j++) avg_dw[j] += localGrads[j];
-                        avg_db += localGrads[inputSize];
-
-                        // Sum workers
-                        for (double[] wg : allWorkerGrads) {
-                            for (int j = 0; j < inputSize; j++) avg_dw[j] += wg[j];
-                            avg_db += wg[inputSize];
+                        for (double[] g : gradients) {
+                            for (int j = 0; j < inputSize; j++) avg_dw[j] += g[j];
+                            avg_db += g[inputSize];
                         }
+                        int N = gradients.size();
+                        for (int j = 0; j < inputSize; j++) avg_dw[j] /= N;
+                        avg_db /= N;
 
-                        // Average
-                        int contributingNodes = 1 + allWorkerGrads.size();
-                        for (int j = 0; j < inputSize; j++) avg_dw[j] /= contributingNodes;
-                        avg_db /= contributingNodes;
+                        // Update
+                        double lr = 0.1;
+                        for (int j = 0; j < inputSize; j++) w[j] -= lr * avg_dw[j];
+                        b -= lr * avg_db;
 
-                        // Update Weights (Learning Rate 0.1 for Logistic Regression)
-                        // Gradient Descent: w = w - lr * grad
-                        double learningRate = 0.1;
-                        for (int j = 0; j < inputSize; j++)
-                            w[j] = w[j] - (learningRate * avg_dw[j]);
-                        b = b - (learningRate * avg_db);
+                        // Progress Update to Client
+                        if (epoch % 5 == 0 || epoch == 49) {
+                            out.writeUTF("Progress: Epoch " + (epoch + 1) + "/50 completed.");
+                            out.flush();
+                        }
                     }
 
-                    System.out.println("Training Complete (50 Epochs).");
+                    System.out.println("Training Complete.");
 
                     // Save Model
                     int modelId = trainedModels.incrementAndGet();
                     Model newModel = new Model(w, b);
                     modelStore.put(modelId, newModel);
                     modelNames.put(modelId, "Model " + modelId);
-
-                    // Save State
                     saveState();
 
-                    // RAFT Commit to ALL Workers
-                    synchronized (workersLock) {
-                        for (WorkerConnection worker : workers) {
-                            try {
-                                worker.out.writeByte(0x07); // COMMIT_ENTRY
-                                // Payload: [ModelID][InputSize][w...][b]
+                    // Commit to Workers
+                    for (WorkerConnection worker : workers) {
+                        try {
+                            synchronized(worker.out) {
+                                worker.out.writeByte(0x07); // COMMIT
                                 worker.out.writeInt(4 + 4 + (inputSize * 8) + 8);
                                 worker.out.writeInt(modelId);
                                 worker.out.writeInt(inputSize);
-                                for (double val : w)
-                                    worker.out.writeDouble(val);
+                                for (double val : w) worker.out.writeDouble(val);
                                 worker.out.writeDouble(b);
                                 worker.out.flush();
-                            } catch (IOException e) {
-                                System.err.println("Error committing to worker " + worker.port);
                             }
+                        } catch (Exception e) {
+                            // worker might have died
                         }
                     }
 
                     out.writeUTF("Training Complete. Model ID: " + modelId);
+
                 } else if (header == 0x06) { // PREDICT
+                    // ... Same as before ...
                     int length = in.readInt();
                     byte[] payload = new byte[length];
                     in.readFully(payload);
                     ByteBuffer bb = ByteBuffer.wrap(payload);
-
                     int modelId = bb.getInt();
-                    int inputSize = (length - 4) / 8; // Remaining bytes are doubles
-
+                    int inputSize = (length - 4) / 8;
                     double[] inputVal = new double[inputSize];
-                    for (int i = 0; i < inputSize; i++)
-                        inputVal[i] = bb.getDouble();
+                    for (int i = 0; i < inputSize; i++) inputVal[i] = bb.getDouble();
 
                     Model m = modelStore.get(modelId);
                     if (m != null) {
-                        if (m.w.length != inputSize) {
-                            out.writeUTF("Error: Input size mismatch.");
-                        } else {
-                            double z = m.b;
-                            for (int i = 0; i < inputSize; i++)
-                                z += m.w[i] * inputVal[i];
-                            double probability = 1.0 / (1.0 + Math.exp(-z));
-                            String label = (probability > 0.5) ? "Dígito 1" : "Dígito 0";
-                            out.writeUTF(label + " (Prob: " + String.format("%.2f", probability) + ")");
-                        }
+                        double z = m.b;
+                        for (int i = 0; i < inputSize; i++) z += m.w[i] * inputVal[i];
+                        double probability = 1.0 / (1.0 + Math.exp(-z));
+                        String label = (probability > 0.5) ? "Dígito 1" : "Dígito 0";
+                        out.writeUTF(label + " (Prob: " + String.format("%.2f", probability) + ")");
                     } else {
-                        out.writeUTF("Error: Model " + modelId + " not found.");
+                        out.writeUTF("Error: Model not found.");
                     }
+
                 } else if (header == 0x08) { // GET_MODELS
                     int count = modelStore.size();
                     out.writeInt(count);
@@ -392,17 +426,15 @@ public class NodoLider {
                         out.writeInt(id);
                         out.writeUTF(modelNames.getOrDefault(id, "Model " + id));
                     }
-                } else if (header == 0x09) { // UPDATE_MODEL_NAME
+                } else if (header == 0x09) { // UPDATE_NAME
                     int length = in.readInt();
                     byte[] payload = new byte[length];
                     in.readFully(payload);
                     ByteBuffer bb = ByteBuffer.wrap(payload);
-
                     int modelId = bb.getInt();
                     byte[] nameBytes = new byte[length - 4];
                     bb.get(nameBytes);
                     String name = new String(nameBytes, java.nio.charset.StandardCharsets.UTF_8);
-
                     if (modelStore.containsKey(modelId)) {
                         modelNames.put(modelId, name);
                         out.writeUTF("Name updated.");
@@ -410,45 +442,25 @@ public class NodoLider {
                         out.writeUTF("Model not found.");
                     }
                 } else if (header == 0x10) { // LIST_WORKERS
-                    synchronized(workersLock) {
-                        int count = workers.size();
-                        out.writeInt(count);
-                        for (WorkerConnection worker : workers) {
-                            String host = worker.host;
-                            if (host.equals("0:0:0:0:0:0:0:1")) host = "localhost";
-                            out.writeUTF(host);
-                            out.writeInt(worker.port);
-                        }
+                    int count = workers.size();
+                    out.writeInt(count);
+                    for (WorkerConnection worker : workers) {
+                        out.writeUTF(worker.remoteIp);
+                        out.writeInt(worker.remotePort);
                     }
                 } else if (header == 0x11) { // KILL_WORKER
                     int portToKill = in.readInt();
                     boolean found = false;
-                    WorkerConnection target = null;
-
-                    synchronized(workersLock) {
-                        for (WorkerConnection worker : workers) {
-                            if (worker.port == portToKill) {
-                                target = worker;
-                                break;
-                            }
-                        }
-                        if (target != null) {
-                            try {
-                                target.socket.close();
-                            } catch (IOException e) {
-                                // Ignore
-                            }
-                            workers.remove(target);
+                    for (WorkerConnection worker : workers) {
+                        if (worker.remotePort == portToKill) {
+                            try { worker.socket.close(); } catch (Exception e) {}
+                            workers.remove(worker);
                             found = true;
+                            break;
                         }
                     }
-
-                    if (found) {
-                        out.writeUTF("Worker on port " + portToKill + " disconnected.");
-                        System.out.println("Worker on port " + portToKill + " killed by client request.");
-                    } else {
-                        out.writeUTF("Worker not found.");
-                    }
+                    if (found) out.writeUTF("Worker killed.");
+                    else out.writeUTF("Worker not found.");
                 }
 
             } catch (IOException e) {
@@ -462,7 +474,6 @@ public class NodoLider {
             oos.writeObject(trainedModels);
             oos.writeObject(modelStore);
             oos.writeObject(modelNames);
-            System.out.println("State saved to disk.");
         } catch (IOException e) {
             System.err.println("Error saving state: " + e.getMessage());
         }
@@ -471,59 +482,15 @@ public class NodoLider {
     @SuppressWarnings("unchecked")
     private static void loadState() {
         File file = new File("estado_sistema.dat");
-        if (!file.exists()) {
-            System.out.println("No saved state found. Starting fresh.");
-            return;
-        }
+        if (!file.exists()) return;
         try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
             trainedModels = (AtomicInteger) ois.readObject();
             modelStore = (java.util.Map<Integer, Model>) ois.readObject();
             modelNames = (java.util.Map<Integer, String>) ois.readObject();
-            System.out.println("State restored. Models count: " + trainedModels.get());
-        } catch (IOException | ClassNotFoundException e) {
-            System.err.println("Error loading state (starting fresh): " + e.getMessage());
+        } catch (Exception e) {
             trainedModels = new AtomicInteger(0);
             modelStore = new java.util.concurrent.ConcurrentHashMap<>();
             modelNames = new java.util.concurrent.ConcurrentHashMap<>();
-        }
-    }
-
-    static class TrainingCore {
-        private static double sigmoid(double z) {
-            return 1.0 / (1.0 + Math.exp(-z));
-        }
-
-        public static double[] computeGradients(double[][] inputs, double[] targets, int inputSize, double[] w, double b) {
-            double[] grad_w = new double[inputSize];
-            double grad_b = 0.0;
-
-            for (int i = 0; i < inputs.length; i++) {
-                double z = b;
-                for (int j = 0; j < inputSize; j++)
-                    z += w[j] * inputs[i][j];
-
-                double pred = sigmoid(z);
-                double error = targets[i] - pred;
-
-                // Gradient Descent for Logistic Regression (Cross-Entropy)
-                // dL/dw = (pred - y) * x
-                // Here error = y - pred, so dL/dw = -error * x
-                // Maintaining the -2 factor to align with previous linear regression style
-                // and the worker implementation, effectively increasing learning rate by 2.
-                for (int j = 0; j < inputSize; j++)
-                    grad_w[j] += -2 * inputs[i][j] * error;
-                grad_b += -2 * error;
-            }
-
-            if (inputs.length > 0) {
-                for (int j = 0; j < inputSize; j++)
-                    grad_w[j] /= inputs.length;
-                grad_b /= inputs.length;
-            }
-
-            double[] result = Arrays.copyOf(grad_w, inputSize + 1);
-            result[inputSize] = grad_b;
-            return result;
         }
     }
 }

@@ -59,7 +59,7 @@ class DistributedClient:
         columns = ("ip", "port")
         self.tree = ttk.Treeview(self.frame_cluster, columns=columns, show='headings', height=3)
         self.tree.heading("ip", text="IP")
-        self.tree.heading("port", text="Puerto")
+        self.tree.heading("port", text="Puerto (ID)")
         self.tree.column("ip", width=150)
         self.tree.column("port", width=100)
         self.tree.pack(side=tk.LEFT, padx=5)
@@ -102,7 +102,7 @@ class DistributedClient:
     def monitor_cluster_loop(self):
         while self.running:
             self.fetch_workers()
-            time.sleep(3)
+            time.sleep(2)
 
     def fetch_workers(self):
         try:
@@ -306,23 +306,29 @@ class DistributedClient:
 
                 self.log("Datos enviados. Procesando en el cluster...")
                 
-                # Because the server blocks for 50 epochs, we increase timeout or keep it None (blocking)
-                response_data = s.recv(1024)
-                if len(response_data) > 2:
-                    msg_len = struct.unpack('>H', response_data[:2])[0]
-                    msg = response_data[2:2+msg_len].decode('utf-8')
-                else:
-                    msg = response_data.decode('utf-8', errors='ignore')
+                while True:
+                    # Read loop for progress updates
+                    len_bytes = s.recv(2)
+                    if not len_bytes: break
 
-                self.log(f"Respuesta: {msg}")
-                
-                # Parse Model ID from response "Training Complete. Model ID: X"
-                if "Model ID:" in msg:
-                    try:
-                        model_id = int(msg.split("Model ID:")[1].strip())
-                        self.root.after(0, lambda: self.prompt_model_name(model_id))
-                    except:
-                        pass
+                    msg_len = struct.unpack('>H', len_bytes)[0]
+                    msg_bytes = s.recv(msg_len)
+                    msg = msg_bytes.decode('utf-8')
+
+                    if "Progress:" in msg:
+                         self.root.after(0, lambda m=msg: self.log(m))
+                    elif "Training Complete" in msg:
+                         self.root.after(0, lambda m=msg: self.log(m))
+                         if "Model ID:" in msg:
+                            try:
+                                model_id = int(msg.split("Model ID:")[1].strip())
+                                self.root.after(0, lambda: self.prompt_model_name(model_id))
+                            except:
+                                pass
+                         break
+                    else:
+                         self.root.after(0, lambda m=msg: self.log(m))
+                         break
 
         except Exception as e:
             self.log(f"Error: {e}")
