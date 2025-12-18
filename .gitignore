@@ -3,3 +3,17 @@ docs/
 docs_markdown/
 instrucciones.md
 dataset_prueba/
+train-images-idx3-ubyte.gz
+train-labels-idx1-ubyte.gz
+dataset_mnist/
+worker_data.dat
+
+java_leader/NodoLider.class 
+java_leader/NodoLider$ClientHandler.class 
+java_leader/NodoLider$Model.class 
+java_leader/NodoLider$RaftController.class 
+java_leader/NodoLider$TrainingCore.class 
+java_leader/NodoLider$WebMonitor.class
+java_leader/NodoLider$WorkerConnection.class
+cpp_worker/worker
+estado_sistema.dat
