@@ -352,10 +352,12 @@ public class NodoLider {
                         if (m.w.length != inputSize) {
                             out.writeUTF("Error: Input size mismatch.");
                         } else {
-                            double prediction = m.b;
+                            double z = m.b;
                             for (int i = 0; i < inputSize; i++)
-                                prediction += m.w[i] * inputVal[i];
-                            out.writeUTF("Prediction: " + prediction);
+                                z += m.w[i] * inputVal[i];
+                            double probability = 1.0 / (1.0 + Math.exp(-z));
+                            String label = (probability > 0.5) ? "Dígito 1" : "Dígito 0";
+                            out.writeUTF("Resultado: " + label + " (Probabilidad: " + String.format("%.2f", probability) + ")");
                         }
                     } else {
                         out.writeUTF("Error: Model " + modelId + " not found.");
@@ -425,6 +427,10 @@ public class NodoLider {
     }
 
     static class TrainingCore {
+        private static double sigmoid(double z) {
+            return 1.0 / (1.0 + Math.exp(-z));
+        }
+
         public static double[] computeGradients(double[][] inputs, double[] targets, int inputSize) {
             double[] w = new double[inputSize];
             Arrays.fill(w, 0.5);
@@ -434,10 +440,11 @@ public class NodoLider {
             double grad_b = 0.0;
 
             for (int i = 0; i < inputs.length; i++) {
-                double pred = b;
+                double z = b;
                 for (int j = 0; j < inputSize; j++)
-                    pred += w[j] * inputs[i][j];
+                    z += w[j] * inputs[i][j];
 
+                double pred = sigmoid(z);
                 double error = targets[i] - pred;
 
                 for (int j = 0; j < inputSize; j++)
