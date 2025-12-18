@@ -1,41 +1,58 @@
 import os
-import random
+import gzip
+import struct
+import urllib.request
 from PIL import Image
-import shutil
 
-def generar_dataset():
-    # 1. Crear estructura de carpetas
-    base_dir = os.path.join(os.getcwd(), 'dataset_prueba')
+def preparar_mnist_ligero():
+    # URL de un mirror confiable de MNIST
+    base_url = "https://ossci-datasets.s3.amazonaws.com/mnist/"
+    files = {
+        "images": "train-images-idx3-ubyte.gz",
+        "labels": "train-labels-idx1-ubyte.gz"
+    }
 
-    if os.path.exists(base_dir):
-        shutil.rmtree(base_dir) # Limpiar si ya existe
+    # 1. Descargar archivos binarios si no existen
+    for filename in files.values():
+        if not os.path.exists(filename):
+            print(f"Descargando {filename} (esto es rápido, ~10MB)...")
+            urllib.request.urlretrieve(base_url + filename, filename)
 
-    os.makedirs(base_dir)
+    # 2. Crear carpetas 0 y 1
+    base_dir = "dataset_mnist"
+    for cls in ['0', '1']:
+        os.makedirs(os.path.join(base_dir, cls), exist_ok=True)
 
-    classes = ['0', '1']
-    for cls in classes:
-        os.makedirs(os.path.join(base_dir, cls))
+    print("Extrayendo ceros y unos...")
 
-    # 2. Generar Imágenes
-    num_images_per_class = 50
-    img_size = (32, 32)
+    # 3. Leer Etiquetas
+    with gzip.open(files["labels"], 'rb') as f:
+        # Los primeros 8 bytes son el encabezado (magic number y cantidad)
+        magic, num = struct.unpack(">II", f.read(8))
+        labels = list(f.read())
 
-    for cls in classes:
-        for i in range(num_images_per_class):
-            # Crear imagen aleatoria (Ruido)
-            # Modo 'L' para escala de grises (0-255)
-            # Generamos datos aleatorios para cada pixel
-            pixels = [random.randint(0, 255) for _ in range(img_size[0] * img_size[1])]
-            img = Image.new('L', img_size)
-            img.putdata(pixels)
+    # 4. Leer Imágenes y guardar solo 0s y 1s
+    with gzip.open(files["images"], 'rb') as f:
+        # Los primeros 16 bytes son el encabezado
+        magic, num, rows, cols = struct.unpack(">IIII", f.read(16))
+        
+        count = 0
+        for i in range(num):
+            # Cada imagen mide 28x28 = 784 bytes
+            image_data = f.read(rows * cols)
+            label = str(labels[i])
 
-            filename = f"img_{cls}_{i}.png"
-            filepath = os.path.join(base_dir, cls, filename)
-            img.save(filepath)
+            if label in ['0', '1']:
+                # Crear imagen desde los bytes crudos usando Pillow
+                img = Image.frombytes('L', (cols, rows), image_data)
+                img.save(os.path.join(base_dir, label, f"mnist_{i}.png"))
+                count += 1
+                
+                # Opcional: limitar a 1000 imágenes para que sea instantáneo
+                if count >= 1000: break
 
-    # 3. Confirmación
-    print(f"Dataset generado exitosamente en:")
-    print(base_dir)
+    print(f"✅ Finalizado. {count} imágenes guardadas en '{base_dir}'.")
+    print("Ya puedes borrar los archivos .gz si deseas.")
 
 if __name__ == "__main__":
-    generar_dataset()
+    preparar_mnist_ligero()

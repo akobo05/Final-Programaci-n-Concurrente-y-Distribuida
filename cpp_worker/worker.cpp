@@ -20,9 +20,11 @@
 #include <atomic>
 #include <chrono>
 
-#define PORT_WORKER 5001
-#define PORT_WEB 8081
 #define BUFFER_SIZE 4096
+
+// Defaults
+int port_worker = 5001;
+int port_web = 8081;
 
 // Protocol Commands
 const uint8_t CMD_HEARTBEAT = 0x01;
@@ -111,6 +113,10 @@ uint64_t htond(double val) {
     uint64_t bits;
     std::memcpy(&bits, &val, sizeof(double));
     return htobe64(bits); // Convert Host to Big Endian
+}
+
+double sigmoid(double z) {
+    return 1.0 / (1.0 + exp(-z));
 }
 
 // Save state to disk
@@ -220,7 +226,7 @@ void handle_client(int client_socket) {
             std::vector<char> payload(length);
             if (!read_n_bytes(client_socket, payload.data(), length)) break;
 
-            // Parse Protocol: [NumSamples (4)] [InputSize (4)] [Inputs...] [Targets...]
+            // Parse Protocol: [NumSamples (4)] [InputSize (4)] [W...] [b] [Inputs...] [Targets...]
             if (length < 8) {
                 std::cerr << "Invalid DISTRIBUTE_CHUNK payload length." << std::endl;
                 continue;
@@ -229,11 +235,31 @@ void handle_client(int client_socket) {
             uint32_t num_samples = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
             uint32_t input_size = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
 
-            size_t expected_size = 8 + (size_t)num_samples * input_size * 8 + (size_t)num_samples * 8;
+            // Calculate expected size with Weights and Bias
+            size_t expected_size = 8 +
+                                   (size_t)input_size * 8 + // W
+                                   8 +                      // b
+                                   (size_t)num_samples * input_size * 8 + // Inputs
+                                   (size_t)num_samples * 8;               // Targets
+
             if (length < expected_size) {
                  std::cerr << "Invalid DISTRIBUTE_CHUNK payload size." << std::endl;
                  continue;
             }
+
+            // Read Weights
+            std::vector<double> w;
+            w.reserve(input_size);
+            for(int j=0; j<input_size; j++) {
+                uint64_t temp;
+                std::memcpy(&temp, payload.data() + offset, 8); offset += 8;
+                w.push_back(ntohd(temp));
+            }
+
+            // Read Bias
+            uint64_t temp_b;
+            std::memcpy(&temp_b, payload.data() + offset, 8); offset += 8;
+            double b = ntohd(temp_b);
 
             std::vector<std::vector<double>> inputs(num_samples, std::vector<double>(input_size));
             std::vector<double> targets(num_samples);
@@ -251,22 +277,21 @@ void handle_client(int client_socket) {
                 targets[i] = ntohd(temp);
             }
 
-            std::cout << "[WORKER] Training on " << num_samples << " images (size " << input_size << ")..." << std::endl;
+            // std::cout << "[WORKER] Training on " << num_samples << " images (size " << input_size << ")..." << std::endl;
 
             // Linear Regression Gradient Descent (Vectorized)
             // Model: y = W.x + b
-            std::vector<double> w(input_size, 0.5); // Fixed start
-            double b = 0.5;
             
             std::vector<double> grad_w(input_size, 0.0);
             double grad_b = 0.0;
 
             for(int i=0; i<num_samples; i++) {
-                double pred = b;
+                double z = b;
                 for(int j=0; j<input_size; j++) {
-                    pred += w[j] * inputs[i][j];
+                    z += w[j] * inputs[i][j];
                 }
                 
+                double pred = sigmoid(z);
                 double error = targets[i] - pred;
                 
                 for(int j=0; j<input_size; j++) {
@@ -396,12 +421,14 @@ void handle_client(int client_socket) {
                     if (m.input_size != (uint32_t)input_size) {
                         response = "Error: Input size mismatch.";
                     } else {
-                        double prediction = m.b;
+                        double z = m.b;
                         for(int i=0; i<input_size; i++) {
-                            prediction += m.w[i] * input_val[i];
+                            z += m.w[i] * input_val[i];
                         }
+                        double prob = sigmoid(z);
                         std::ostringstream oss;
-                        oss << "Prediction: " << prediction;
+                        oss << "Prediction: " << (prob > 0.5 ? "Dígito 1" : "Dígito 0")
+                            << " (Prob: " << std::fixed << std::setprecision(2) << prob << ")";
                         response = oss.str();
                     }
                 } else {
@@ -433,7 +460,7 @@ void* web_server(void* arg) {
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT_WEB);
+    address.sin_port = htons(port_web);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("web bind failed");
@@ -445,7 +472,7 @@ void* web_server(void* arg) {
         return NULL;
     }
 
-    std::cout << "Web Monitor listening on port " << PORT_WEB << std::endl;
+    std::cout << "Web Monitor listening on port " << port_web << std::endl;
 
     while (true) {
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
@@ -491,7 +518,12 @@ void* web_server(void* arg) {
     return NULL;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    if (argc >= 3) {
+        port_worker = std::stoi(argv[1]);
+        port_web = std::stoi(argv[2]);
+    }
+
     // Initialize Timer
     last_heartbeat_time = current_time_ms();
 
@@ -526,7 +558,7 @@ int main() {
 
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(PORT_WORKER);
+    address.sin_port = htons(port_worker);
 
     if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
         perror("bind failed");
@@ -538,7 +570,7 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    std::cout << "Worker listening on port " << PORT_WORKER << std::endl;
+    std::cout << "Worker initiated on port: " << port_worker << " (Web: " << port_web << ")" << std::endl;
 
     while (true) {
         if ((new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
