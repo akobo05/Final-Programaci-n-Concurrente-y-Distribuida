@@ -115,6 +115,10 @@ uint64_t htond(double val) {
     return htobe64(bits); // Convert Host to Big Endian
 }
 
+double sigmoid(double z) {
+    return 1.0 / (1.0 + exp(-z));
+}
+
 // Save state to disk
 void save_state() {
     std::lock_guard<std::mutex> lock(model_mutex);
@@ -264,11 +268,12 @@ void handle_client(int client_socket) {
             double grad_b = 0.0;
 
             for(int i=0; i<num_samples; i++) {
-                double pred = b;
+                double z = b;
                 for(int j=0; j<input_size; j++) {
-                    pred += w[j] * inputs[i][j];
+                    z += w[j] * inputs[i][j];
                 }
                 
+                double pred = sigmoid(z);
                 double error = targets[i] - pred;
                 
                 for(int j=0; j<input_size; j++) {
