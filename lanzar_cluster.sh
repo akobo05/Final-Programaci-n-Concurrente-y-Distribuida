@@ -18,27 +18,23 @@ echo "🔨 Compilando..."
 g++ -pthread -o cpp_worker/worker cpp_worker/worker.cpp
 javac java_leader/NodoLider.java
 
-echo "🚀 Lanzando $NUM_WORKERS Workers en $IP_LIDER..."
+echo "👑 Iniciando Líder..."
+# El Líder ya no conecta a los workers, espera conexiones.
+java -cp java_leader NodoLider &
 
-WORKER_PORTS=""
+sleep 2
+
+echo "🚀 Lanzando $NUM_WORKERS Workers que conectarán al Líder..."
 
 for i in $(seq 0 $((NUM_WORKERS - 1))); do
     W_PORT=$((BASE_PORT_WORKER + i))
     WEB_PORT=$((BASE_PORT_WEB + i))
 
-    # Lanzar cada worker con puertos únicos
+    # Lanzar cada worker con puertos únicos (para identidad y web)
+    # Se conectan automáticamente a localhost:9000
     ./cpp_worker/worker $W_PORT $WEB_PORT &
-    echo "  ✅ Worker $i en puertos $W_PORT y $WEB_PORT"
-
-    WORKER_PORTS="$WORKER_PORTS $W_PORT"
+    echo "  ✅ Worker $i (ID: $W_PORT, Web: $WEB_PORT)"
 done
-
-sleep 2
-
-echo "👑 Iniciando Líder..."
-# El Líder recibe la lista de puertos de los workers
-echo "   Connecting Leader to ports: $WORKER_PORTS"
-java -cp java_leader NodoLider $WORKER_PORTS &
 
 sleep 2
 
@@ -47,9 +43,6 @@ if [ -d ".venv" ]; then
     source .venv/bin/activate
 fi
 
-# Check if python client exists and can be run (requires GUI usually, but maybe headless)
-# If this is a headless environment, client might fail to open window.
-# But I will include it as per instructions.
 python python_client/cliente.py &
 
 wait
