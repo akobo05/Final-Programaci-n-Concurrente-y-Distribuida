@@ -49,6 +49,22 @@ class DistributedClient:
         self.btn_train = tk.Button(self.frame_train, text="Iniciar Entrenamiento", command=self.start_training_thread, state=tk.DISABLED)
         self.btn_train.pack(pady=5)
 
+        # Cluster Management Section
+        self.frame_cluster = tk.LabelFrame(root, text="Gestión del Cluster", padx=10, pady=10)
+        self.frame_cluster.pack(pady=5, fill="x", padx=10)
+
+        # Treeview
+        columns = ("ip", "port")
+        self.tree = ttk.Treeview(self.frame_cluster, columns=columns, show='headings', height=3)
+        self.tree.heading("ip", text="IP")
+        self.tree.heading("port", text="Puerto")
+        self.tree.column("ip", width=100)
+        self.tree.column("port", width=80)
+        self.tree.pack(side=tk.LEFT, padx=5)
+
+        self.btn_kill = tk.Button(self.frame_cluster, text="Simular Caída", command=self.kill_worker)
+        self.btn_kill.pack(side=tk.LEFT, padx=5)
+
         # Testing Section
         self.frame_test = tk.LabelFrame(root, text="Testeo / Inferencia", padx=10, pady=10)
         self.frame_test.pack(pady=5, fill="x", padx=10)
@@ -69,6 +85,82 @@ class DistributedClient:
         
         # Initial fetch
         self.fetch_models_thread()
+        # Start cluster monitor loop
+        self.monitor_cluster_loop()
+
+    def monitor_cluster_loop(self):
+        threading.Thread(target=self.fetch_workers).start()
+        self.root.after(3000, self.monitor_cluster_loop)
+
+    def fetch_workers(self):
+        try:
+            s = self.get_active_leader_socket()
+            with s:
+                # Protocol: [0x10] (No payload)
+                s.sendall(b'\x10')
+
+                count_bytes = s.recv(4)
+                if not count_bytes: return
+                count = struct.unpack('>I', count_bytes)[0]
+
+                workers = []
+                for _ in range(count):
+                    # Read UTF host
+                    len_bytes = s.recv(2)
+                    host_len = struct.unpack('>H', len_bytes)[0]
+                    host_bytes = s.recv(host_len)
+                    host = host_bytes.decode('utf-8')
+
+                    # Read port
+                    port_bytes = s.recv(4)
+                    port = struct.unpack('>I', port_bytes)[0]
+
+                    workers.append((host, port))
+
+                self.root.after(0, lambda: self.update_cluster_ui(workers))
+        except:
+            pass # Silent fail if leader down
+
+    def update_cluster_ui(self, workers):
+        # Clear existing
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for w in workers:
+            self.tree.insert('', tk.END, values=w)
+
+    def kill_worker(self):
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showerror("Error", "Selecciona un worker de la lista.")
+            return
+
+        item = self.tree.item(selection[0])
+        values = item['values']
+        # values is a list/tuple: ['ip', port]
+        # Tkinter treeview values are often strings even if inserted as int
+        port = int(values[1])
+
+        if messagebox.askyesno("Confirmar", f"¿Seguro que deseas desconectar el worker en puerto {port}?"):
+            threading.Thread(target=self.send_kill_command, args=(port,)).start()
+
+    def send_kill_command(self, port):
+        try:
+            s = self.get_active_leader_socket()
+            with s:
+                # Protocol: [0x11] [Port]
+                s.sendall(b'\x11')
+                s.sendall(struct.pack('>I', port))
+
+                resp_len_bytes = s.recv(2)
+                resp_len = struct.unpack('>H', resp_len_bytes)[0]
+                resp_bytes = s.recv(resp_len)
+                msg = resp_bytes.decode('utf-8')
+
+                self.root.after(0, lambda: self.log(f"Respuesta Cluster: {msg}"))
+                self.fetch_workers() # Refresh list immediately
+        except Exception as e:
+            self.root.after(0, lambda: self.log(f"Error gestionando cluster: {e}"))
 
     def log(self, message):
         self.log_text.insert(tk.END, message + "\n")
