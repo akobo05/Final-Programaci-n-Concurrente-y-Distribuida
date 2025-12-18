@@ -25,6 +25,9 @@ public class NodoLider {
     public static void main(String[] args) {
         System.out.println("Starting Leader Node...");
 
+        // 0. Load State
+        loadState();
+
         // 1. Connect to Worker (Follower)
         connectToWorker();
 
@@ -118,7 +121,8 @@ public class NodoLider {
     }
 
     // Model Storage
-    static class Model {
+    static class Model implements Serializable {
+        private static final long serialVersionUID = 1L;
         double[] w;
         double b;
 
@@ -233,6 +237,9 @@ public class NodoLider {
                     modelStore.put(modelId, newModel);
                     modelNames.put(modelId, "Model " + modelId); // Default Name
 
+                    // Save State
+                    saveState();
+
                     // RAFT Commit
                     synchronized (workerLock) {
                         workerOut.writeByte(0x07); // COMMIT_ENTRY
@@ -302,6 +309,38 @@ public class NodoLider {
             } catch (IOException e) {
                 e.printStackTrace();
             }
+        }
+    }
+
+    private static synchronized void saveState() {
+        try (ObjectOutputStream oos = new ObjectOutputStream(new FileOutputStream("estado_sistema.dat"))) {
+            oos.writeObject(trainedModels);
+            oos.writeObject(modelStore);
+            oos.writeObject(modelNames);
+            System.out.println("State saved to disk.");
+        } catch (IOException e) {
+            System.err.println("Error saving state: " + e.getMessage());
+        }
+    }
+
+    @SuppressWarnings("unchecked")
+    private static void loadState() {
+        File file = new File("estado_sistema.dat");
+        if (!file.exists()) {
+            System.out.println("No saved state found. Starting fresh.");
+            return;
+        }
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
+            trainedModels = (AtomicInteger) ois.readObject();
+            modelStore = (java.util.Map<Integer, Model>) ois.readObject();
+            modelNames = (java.util.Map<Integer, String>) ois.readObject();
+            System.out.println("State restored. Models count: " + trainedModels.get());
+        } catch (IOException | ClassNotFoundException e) {
+            System.err.println("Error loading state (starting fresh): " + e.getMessage());
+            // In case of error, we might want to reset to ensure clean state if partial read happened
+            trainedModels = new AtomicInteger(0);
+            modelStore = new java.util.concurrent.ConcurrentHashMap<>();
+            modelNames = new java.util.concurrent.ConcurrentHashMap<>();
         }
     }
 
