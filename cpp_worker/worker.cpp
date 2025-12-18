@@ -216,17 +216,34 @@ void process_commands(int socket_fd) {
             std::vector<char> payload(length);
             if (!read_n_bytes(socket_fd, payload.data(), length)) break;
 
-            // [NumSamples (4)] [InputSize (4)] [Weights (Size*8)] [Bias (8)] [Inputs...] [Targets...]
+            // Parse Protocol: [NumSamples (4)] [InputSize (4)] [W...] [b] [Inputs...] [Targets...]
+            if (length < 8) {
+                std::cerr << "Invalid DISTRIBUTE_CHUNK payload length." << std::endl;
+                continue;
+            }
             int offset = 0;
             uint32_t num_samples = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
             uint32_t input_size = ntohl(*(uint32_t*)(payload.data() + offset)); offset += 4;
 
+            // Calculate expected size with Weights and Bias
+            size_t expected_size = 8 +
+                                   (size_t)input_size * 8 + // W
+                                   8 +                      // b
+                                   (size_t)num_samples * input_size * 8 + // Inputs
+                                   (size_t)num_samples * 8;               // Targets
+
+            if (length < expected_size) {
+                 std::cerr << "Invalid DISTRIBUTE_CHUNK payload size." << std::endl;
+                 continue;
+            }
+
             // Read Weights
-            std::vector<double> w(input_size);
+            std::vector<double> w;
+            w.reserve(input_size);
             for(int j=0; j<input_size; j++) {
                 uint64_t temp;
                 std::memcpy(&temp, payload.data() + offset, 8); offset += 8;
-                w[j] = ntohd(temp);
+                w.push_back(ntohd(temp));
             }
 
             // Read Bias
@@ -234,7 +251,6 @@ void process_commands(int socket_fd) {
             std::memcpy(&temp_b, payload.data() + offset, 8); offset += 8;
             double b = ntohd(temp_b);
 
-            // Read Inputs and Targets
             std::vector<std::vector<double>> inputs(num_samples, std::vector<double>(input_size));
             std::vector<double> targets(num_samples);
 
@@ -251,9 +267,11 @@ void process_commands(int socket_fd) {
                 targets[i] = ntohd(temp);
             }
 
-            // std::cout << "[WORKER] Processing chunk: " << num_samples << " samples." << std::endl;
+            // std::cout << "[WORKER] Training on " << num_samples << " images (size " << input_size << ")..." << std::endl;
 
-            // Logistic Regression Gradient Calculation
+            // Linear Regression Gradient Descent (Vectorized)
+            // Model: y = W.x + b
+            
             std::vector<double> grad_w(input_size, 0.0);
             double grad_b = 0.0;
 

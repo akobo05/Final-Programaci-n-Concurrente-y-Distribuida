@@ -217,126 +217,90 @@ public class NodoLider {
                     for (int i = 0; i < numSamples; i++)
                         targets[i] = bb.getDouble();
 
-                    System.out.println("[CLIENT] Training Request: " + numSamples + " images.");
+                    System.out
+                            .println("[CLIENT] Training Request: " + numSamples + " images (size " + inputSize + ").");
 
-                    // Initial Random Weights (-0.01 to 0.01)
+                    // Split Data among Leader + Workers
+                    int totalNodes = 1 + workers.size();
+                    int chunkSize = numSamples / totalNodes;
+
+                    // --- 1. Leader Processing (Local) ---
+                    // Process the first chunk
+                    // Initialization (Random small values)
                     double[] w = new double[inputSize];
-                    Random rand = new Random();
                     for(int j=0; j<inputSize; j++) {
-                        w[j] = (rand.nextDouble() * 0.02) - 0.01;
+                        w[j] = (Math.random() - 0.5) * 0.01;
                     }
-                    double b = (rand.nextDouble() * 0.02) - 0.01;
+                    double b = (Math.random() - 0.5) * 0.01;
 
-                    System.out.println("Starting 50 epochs of distributed training...");
+                    System.out.println("[LEADER] Starting Training (50 Epochs)...");
 
+                    // Epoch Loop
                     for (int epoch = 0; epoch < 50; epoch++) {
-                        // 1. Create Task Queue
-                        ConcurrentLinkedQueue<Chunk> taskQueue = new ConcurrentLinkedQueue<>();
+                        int startIdx = 0;
+                        int endIdx = chunkSize + (numSamples % totalNodes); // Give remainder to leader
 
-                        // Decide chunk size based on CURRENT workers (soft target) or fixed size
-                        // Better to use fixed reasonable size or divide by current workers.
-                        int currentWorkerCount = workers.size();
-                        int splits = Math.max(1, currentWorkerCount); // at least 1 split
-                        int chunkSize = numSamples / splits;
-                        if (chunkSize < 1) chunkSize = 1;
+                        double[][] localInputs = Arrays.copyOfRange(inputs, startIdx, endIdx);
+                        double[] localTargets = Arrays.copyOfRange(targets, startIdx, endIdx);
+                        double[] localGrads = TrainingCore.computeGradients(localInputs, localTargets, inputSize, w, b);
 
-                        int start = 0;
-                        while (start < numSamples) {
-                            int end = Math.min(start + chunkSize, numSamples);
-                            double[][] chunkInputs = Arrays.copyOfRange(inputs, start, end);
-                            double[] chunkTargets = Arrays.copyOfRange(targets, start, end);
-                            taskQueue.add(new Chunk(chunkInputs, chunkTargets, start));
-                            start = end;
-                        }
+                        startIdx = endIdx;
 
-                        List<double[]> gradients = new ArrayList<>();
+                        // --- 2. Worker Processing (Distributed) ---
+                        List<double[]> allWorkerGrads = new ArrayList<>();
 
-                        // Process Queue
-                        while (!taskQueue.isEmpty()) {
-                            // Find available worker
-                            WorkerConnection assignedWorker = null;
-                            for (WorkerConnection wc : workers) {
-                                assignedWorker = wc;
-                                break;
-                            }
+                        if (!workers.isEmpty()) {
+                            synchronized (workersLock) {
+                                // Send chunks to all workers
+                                for (WorkerConnection worker : workers) {
+                                    int wStart = startIdx;
+                                    int wEnd = startIdx + chunkSize;
+                                    startIdx = wEnd; // Advance for next worker
 
-                            if (workers.isEmpty()) {
-                                System.out.println("No workers available! Waiting...");
-                                try { Thread.sleep(1000); } catch (Exception e) {}
-                                continue;
-                            }
+                                    int wCount = wEnd - wStart;
+                                    if (wCount <= 0) continue; // Should not happen if math is right
 
-                            // Let's implement the "Master-Worker" pattern correctly.
-                            // We have N workers. We have M chunks.
-                            // Create N threads (one per worker).
-                            // Each thread pulls from `taskQueue`.
+                                    try {
+                                        worker.out.writeByte(CMD_DISTRIBUTE_CHUNK);
+                                        // Payload: [NumSamples][InputSize][W...][b][Inputs...][Targets...]
+                                        int payloadSize = 4 + 4 + (inputSize * 8) + 8 + (wCount * inputSize * 8) + (wCount * 8);
+                                        worker.out.writeInt(payloadSize);
+                                        worker.out.writeInt(wCount);
+                                        worker.out.writeInt(inputSize);
 
-                            List<Thread> threads = new ArrayList<>();
-                            List<WorkerConnection> snapshotWorkers = new ArrayList<>(workers);
+                                        // Send Weights & Bias
+                                        for(double val : w) worker.out.writeDouble(val);
+                                        worker.out.writeDouble(b);
 
-                            // Collections.synchronizedList for gradients
-                            List<double[]> threadSafeGradients = java.util.Collections.synchronizedList(gradients);
-
-                            final double bCopy = b;
-
-                            for (WorkerConnection wc : snapshotWorkers) {
-                                Thread t = new Thread(() -> {
-                                    while (true) {
-                                        Chunk c = taskQueue.poll();
-                                        if (c == null) break; // No more work
-
-                                        try {
-                                            synchronized (wc.out) { // Lock socket
-                                                wc.out.writeByte(CMD_DISTRIBUTE_CHUNK);
-                                                // Payload
-                                                int payloadSize = 4 + 4 + (inputSize * 8) + 8 + (c.inputs.length * inputSize * 8) + (c.inputs.length * 8);
-                                                wc.out.writeInt(payloadSize);
-                                                wc.out.writeInt(c.inputs.length);
-                                                wc.out.writeInt(inputSize);
-                                                // Weights
-                                                for(double val : w) wc.out.writeDouble(val);
-                                                wc.out.writeDouble(bCopy);
-                                                // Data
-                                                for (int i = 0; i < c.inputs.length; i++) {
-                                                    for (int j = 0; j < inputSize; j++) wc.out.writeDouble(c.inputs[i][j]);
-                                                }
-                                                for (int i = 0; i < c.targets.length; i++) wc.out.writeDouble(c.targets[i]);
-                                                wc.out.flush();
-
-                                                // Read Result
-                                                byte respHeader = wc.in.readByte();
-                                                if (respHeader == CMD_TRAIN_RESULT) {
-                                                    int respLen = wc.in.readInt();
-                                                    double[] wGrads = new double[inputSize + 1];
-                                                    for (int j = 0; j < inputSize; j++) wGrads[j] = wc.in.readDouble();
-                                                    wGrads[inputSize] = wc.in.readDouble(); // Bias
-                                                    threadSafeGradients.add(wGrads);
-                                                } else {
-                                                    throw new IOException("Unexpected header: " + respHeader);
-                                                }
-                                            }
-                                        } catch (IOException e) {
-                                            System.out.println("Worker " + wc.remotePort + " failed. Reassigning task...");
-                                            taskQueue.add(c); // Reassign
-                                            workers.remove(wc);
-                                            try { wc.socket.close(); } catch(Exception ex) {}
-                                            break; // Worker dead, thread exit
+                                        // Send Data
+                                        for (int i = wStart; i < wEnd; i++) {
+                                            for (int j = 0; j < inputSize; j++)
+                                                worker.out.writeDouble(inputs[i][j]);
                                         }
+                                        for (int i = wStart; i < wEnd; i++)
+                                            worker.out.writeDouble(targets[i]);
+                                        worker.out.flush();
+                                    } catch (IOException e) {
+                                        System.err.println("Error sending chunk to worker " + worker.port);
+                                        // Handle failure? For now, ignore (results will be partial)
                                     }
-                                });
-                                t.start();
-                                threads.add(t);
-                            }
+                                }
 
-                            for (Thread t : threads) {
-                                try { t.join(); } catch (InterruptedException e) {}
-                            }
-
-                            // If queue still has items (all workers died?), we loop again
-                            if (!taskQueue.isEmpty()) {
-                                if (workers.isEmpty()) {
-                                    System.out.println("All workers dead. Pausing...");
-                                    try { Thread.sleep(2000); } catch (Exception e) {}
+                                // Receive results from all workers
+                                for (WorkerConnection worker : workers) {
+                                    try {
+                                        byte respHeader = worker.in.readByte();
+                                        if (respHeader == CMD_TRAIN_RESULT) {
+                                            int respLen = worker.in.readInt();
+                                            double[] wGrads = new double[inputSize + 1];
+                                            for (int j = 0; j < inputSize; j++)
+                                                wGrads[j] = worker.in.readDouble();
+                                            wGrads[inputSize] = worker.in.readDouble(); // Bias
+                                            allWorkerGrads.add(wGrads);
+                                        }
+                                    } catch (IOException e) {
+                                        System.err.println("Error receiving from worker " + worker.port);
+                                    }
                                 }
                                 continue; // Retry remaining chunks
                             } else {
@@ -344,32 +308,35 @@ public class NodoLider {
                             }
                         }
 
-                        // Aggregate
-                        if (gradients.isEmpty()) continue;
-
+                        // --- 3. Aggregate Gradients ---
                         double[] avg_dw = new double[inputSize];
                         double avg_db = 0.0;
-                        for (double[] g : gradients) {
-                            for (int j = 0; j < inputSize; j++) avg_dw[j] += g[j];
-                            avg_db += g[inputSize];
+
+                        // Sum local
+                        for (int j = 0; j < inputSize; j++) avg_dw[j] += localGrads[j];
+                        avg_db += localGrads[inputSize];
+
+                        // Sum workers
+                        for (double[] wg : allWorkerGrads) {
+                            for (int j = 0; j < inputSize; j++) avg_dw[j] += wg[j];
+                            avg_db += wg[inputSize];
                         }
-                        int N = gradients.size();
-                        for (int j = 0; j < inputSize; j++) avg_dw[j] /= N;
-                        avg_db /= N;
 
-                        // Update
-                        double lr = 0.1;
-                        for (int j = 0; j < inputSize; j++) w[j] -= lr * avg_dw[j];
-                        b -= lr * avg_db;
+                        // Average
+                        int contributingNodes = 1 + allWorkerGrads.size();
+                        for (int j = 0; j < inputSize; j++) avg_dw[j] /= contributingNodes;
+                        avg_db /= contributingNodes;
 
-                        // Progress Update to Client
-                        if (epoch % 5 == 0 || epoch == 49) {
-                            out.writeUTF("Progress: Epoch " + (epoch + 1) + "/50 completed.");
-                            out.flush();
+                        // Update Weights
+                        for (int j = 0; j < inputSize; j++)
+                            w[j] = w[j] - (0.01 * avg_dw[j]);
+                        b = b - (0.01 * avg_db);
+
+                        // Optional: Log every 10 epochs
+                        if ((epoch + 1) % 10 == 0) {
+                             System.out.println("[LEADER] Epoch " + (epoch + 1) + "/50 completed.");
                         }
                     }
-
-                    System.out.println("Training Complete.");
 
                     // Save Model
                     int modelId = trainedModels.incrementAndGet();
@@ -410,11 +377,17 @@ public class NodoLider {
 
                     Model m = modelStore.get(modelId);
                     if (m != null) {
-                        double z = m.b;
-                        for (int i = 0; i < inputSize; i++) z += m.w[i] * inputVal[i];
-                        double probability = 1.0 / (1.0 + Math.exp(-z));
-                        String label = (probability > 0.5) ? "Dígito 1" : "Dígito 0";
-                        out.writeUTF(label + " (Prob: " + String.format("%.2f", probability) + ")");
+                        if (m.w.length != inputSize) {
+                            out.writeUTF("Error: Input size mismatch.");
+                        } else {
+                            double z = m.b;
+                            for (int i = 0; i < inputSize; i++)
+                                z += m.w[i] * inputVal[i];
+                            double probability = 1.0 / (1.0 + Math.exp(-z));
+                            // Threshold check: > 0.5 is 1, else 0
+                            String label = (probability > 0.5) ? "Es un 1" : "Es un 0";
+                            out.writeUTF("Resultado: " + label + " (Probabilidad: " + String.format("%.2f", probability) + ")");
+                        }
                     } else {
                         out.writeUTF("Error: Model not found.");
                     }
@@ -491,6 +464,41 @@ public class NodoLider {
             trainedModels = new AtomicInteger(0);
             modelStore = new java.util.concurrent.ConcurrentHashMap<>();
             modelNames = new java.util.concurrent.ConcurrentHashMap<>();
+        }
+    }
+
+    static class TrainingCore {
+        private static double sigmoid(double z) {
+            return 1.0 / (1.0 + Math.exp(-z));
+        }
+
+        public static double[] computeGradients(double[][] inputs, double[] targets, int inputSize, double[] w, double b) {
+            double[] grad_w = new double[inputSize];
+            double grad_b = 0.0;
+
+            for (int i = 0; i < inputs.length; i++) {
+                double z = b;
+                for (int j = 0; j < inputSize; j++)
+                    z += w[j] * inputs[i][j];
+
+                double pred = sigmoid(z);
+                double error = targets[i] - pred;
+
+                for (int j = 0; j < inputSize; j++)
+                    grad_w[j] += -2 * inputs[i][j] * error;
+                grad_b += -2 * error;
+            }
+
+            if (inputs.length > 0) {
+                for (int j = 0; j < inputSize; j++)
+                    grad_w[j] /= inputs.length;
+                grad_b /= inputs.length;
+            }
+
+            // Return [dw1, dw2..., db]
+            double[] result = Arrays.copyOf(grad_w, inputSize + 1);
+            result[inputSize] = grad_b;
+            return result;
         }
     }
 }
