@@ -18,6 +18,12 @@ Este proyecto implementa un sistema distribuido tolerante a fallos para el entre
 ## Instrucciones de Compilación y Ejecución
 
 Es importante seguir el orden de ejecución para asegurar la conexión correcta de los sockets.
+### Ejecucion Directa
+Abre el terminal y ejecuta en la carpeta raiz del proyecto:
+```
+./lanzar_cluster.sh
+```
+### Ejecucion por separado
 
 ### 1. Compilar y Ejecutar el Worker (C++)
 
